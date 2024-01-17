@@ -72,4 +72,5 @@ var (
 	ErrInvalidKeyValue        = errors.New("invalid key or value")
 	ErrModificationNotAllowed = errors.New("modification not allowed")
 	ErrWrongDimensionSize     = errors.New("wrong dimensions size")
+	ErrBlake3UnableToHash     = errors.New("unable to hash given data")
 )

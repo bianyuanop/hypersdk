@@ -422,8 +422,11 @@ func BuildBlock(
 		h := blake3.New(32, nil)
 		// need to check if [tx.Bytes()] determines a transaction
 		txBytes := tx.Bytes()
-		// it returns error, but will never happen
-		h.Write(txBytes)
+		_, err := h.Write(txBytes)
+		// never happen according to blake3 implementation
+		if err != nil {
+			return nil, ErrBlake3UnableToHash
+		}
 		txHash := h.Sum(nil)
 
 		b.TxsHashes = append(b.TxsHashes, txHash)
