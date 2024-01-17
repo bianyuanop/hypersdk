@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
+	"lukechampine.com/blake3"
 
 	"github.com/ava-labs/hypersdk/executor"
 	"github.com/ava-labs/hypersdk/keys"
@@ -414,6 +415,20 @@ func BuildBlock(
 			break
 		}
 	}
+
+	// transaction hash calculation
+	ctx, txHashingSpan := vm.Tracer().Start(ctx, "chain.BuildBlock.TxHashing")
+	for _, tx := range b.Txs {
+		h := blake3.New(32, nil)
+		// need to check if [tx.Bytes()] determines a transaction
+		txBytes := tx.Bytes()
+		// it returns error, but will never happen
+		h.Write(txBytes)
+		txHash := h.Sum(nil)
+
+		b.TxsHashes = append(b.TxsHashes, txHash)
+	}
+	txHashingSpan.End()
 
 	// Wait for stream preparation to finish to make
 	// sure all transactions are returned to the mempool.

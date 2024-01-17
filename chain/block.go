@@ -42,6 +42,8 @@ type StatefulBlock struct {
 
 	Txs []*Transaction `json:"txs"`
 
+	TxsHashes [][]byte `json:"txsHashes"`
+
 	// StateRoot is the root of the post-execution state
 	// of [Prnt].
 	//
