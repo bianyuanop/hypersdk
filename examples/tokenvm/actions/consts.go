@@ -3,6 +3,8 @@
 
 package actions
 
+var DefaultNMTNamespace = make([]byte, 8)
+
 // Note: Registry will error during initialization if a duplicate ID is assigned. We explicitly assign IDs to avoid accidental remapping.
 const (
 	burnAssetID   uint8 = 0

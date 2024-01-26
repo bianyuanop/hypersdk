@@ -186,6 +186,10 @@ func (*FillOrder) ValidRange(chain.Rules) (int64, int64) {
 	return -1, -1
 }
 
+func (*FillOrder) NMTNamespace() []byte {
+	return DefaultNMTNamespace
+}
+
 // OrderResult is a custom successful response output that provides information
 // about a successful trade.
 type OrderResult struct {

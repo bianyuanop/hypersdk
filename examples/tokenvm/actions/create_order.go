@@ -130,6 +130,10 @@ func (*CreateOrder) ValidRange(chain.Rules) (int64, int64) {
 	return -1, -1
 }
 
+func (*CreateOrder) NMTNamespace() []byte {
+	return DefaultNMTNamespace
+}
+
 func PairID(in ids.ID, out ids.ID) string {
 	return fmt.Sprintf("%s-%s", in.String(), out.String())
 }

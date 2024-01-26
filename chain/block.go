@@ -4,7 +4,10 @@
 package chain
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/platformvm/warp"
 	"github.com/ava-labs/avalanchego/x/merkledb"
+	"github.com/celestiaorg/nmt"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -52,6 +56,11 @@ type StatefulBlock struct {
 	// starting the verification of another block, etc.
 	StateRoot   ids.ID     `json:"stateRoot"`
 	WarpResults set.Bits64 `json:"warpResults"`
+
+	NMTRootString string `json:"nmtRootString"`
+	NMTRoot       []byte `json:"nmtRoot"`
+	NMTMinNS      []byte `json:"nmtMinNS"`
+	NMTMaxNS      []byte `json:"mntMaxNS"`
 
 	size int
 
@@ -270,8 +279,52 @@ func (b *StatelessBlock) initializeBuilt(
 	results []*Result,
 	feeManager *FeeManager,
 ) error {
-	_, span := b.vm.Tracer().Start(ctx, "StatelessBlock.initializeBuilt")
+	ctx, span := b.vm.Tracer().Start(ctx, "StatelessBlock.initializeBuilt")
 	defer span.End()
+
+	// NMT generation must before block marshal
+	_, nmtSpan := b.vm.Tracer().Start(ctx, "StatelessBlock.NMTGen")
+	txsDataToProve := make([][]byte, 0, len(b.Txs))
+	for i := 0; i < len(b.Txs); i++ {
+		tx := b.Txs[i]
+		txResult := results[i]
+		txID := tx.ID()
+
+		nID := tx.Action.NMTNamespace()
+
+		// we only use 1 byte for NID
+		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
+		txData = append(txData, nID...)
+		txData = append(txData, txID[:]...)
+		txData = append(txData, txResult.Output...)
+		txsDataToProve = append(txsDataToProve, txData)
+	}
+
+	// default tree uses 8 bytes as namespace id
+	nmtTree := nmt.New(sha256.New())
+	for _, d := range txsDataToProve {
+		if err := nmtTree.Push(d); err != nil {
+			b.vm.Logger().Warn("unable to push element to nmt tree", zap.Error(err))
+			return ErrPushingElementInNMTTree
+		}
+	}
+
+	nmtRoot, err := nmtTree.Root()
+	if err != nil {
+		b.vm.Logger().Warn("unable to compute nmt root", zap.Error(err))
+		return ErrComputingNMTRoot
+	}
+
+	minNS := nmt.MinNamespace(nmtRoot, nmtTree.NamespaceSize())
+	maxNS := nmt.MaxNamespace(nmtRoot, nmtTree.NamespaceSize())
+
+	b.NMTRootString = base64.StdEncoding.EncodeToString(nmtRoot)
+
+	b.NMTMaxNS = maxNS
+	b.NMTMinNS = minNS
+	b.NMTRoot = nmtRoot
+
+	nmtSpan.End()
 
 	blk, err := b.StatefulBlock.Marshal()
 	if err != nil {
@@ -290,6 +343,7 @@ func (b *StatelessBlock) initializeBuilt(
 			b.containsWarp = true
 		}
 	}
+
 	return nil
 }
 
@@ -587,6 +641,42 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 	}
 	b.results = results
 	b.feeManager = feeManager
+
+	// NMT root generation
+	txsDataToProve := make([][]byte, 0, len(b.Txs))
+	for i := 0; i < len(b.Txs); i++ {
+		tx := b.Txs[i]
+		txResult := b.results[i]
+		txID := tx.ID()
+
+		nID := tx.Action.NMTNamespace()
+
+		// we only use 1 byte for NID
+		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
+		txData = append(txData, nID...)
+		txData = append(txData, txID[:]...)
+		txData = append(txData, txResult.Output...)
+		txsDataToProve = append(txsDataToProve, txData)
+	}
+
+	nmtTree := nmt.New(sha256.New())
+	for _, d := range txsDataToProve {
+		if err := nmtTree.Push(d); err != nil {
+			b.vm.Logger().Warn("unable to push element", zap.ByteString("element", d))
+			return ErrPushingElementInNMTTree
+		}
+	}
+
+	nmtRoot, err := nmtTree.Root()
+	if err != nil {
+		b.vm.Logger().Warn("unable to compute nmt root", zap.Error(err))
+		return ErrComputingNMTRoot
+	}
+
+	if !bytes.Equal(nmtRoot, b.NMTRoot) {
+		b.vm.Logger().Warn("nmt root not equal", zap.ByteString("expect", nmtRoot), zap.ByteString("actual", b.NMTRoot))
+		return ErrNMTRootNotEqual
+	}
 
 	// Ensure warp results are correct
 	if invalidWarpResult {
@@ -975,7 +1065,8 @@ func (b *StatefulBlock) Marshal() ([]byte, error) {
 	size := consts.IDLen + consts.Uint64Len + consts.Uint64Len +
 		consts.Uint64Len + window.WindowSliceSize +
 		consts.IntLen + codec.CummSize(b.Txs) +
-		consts.IDLen + consts.Uint64Len + consts.Uint64Len
+		consts.IDLen + consts.Uint64Len + consts.Uint64Len +
+		consts.NMTRootLen + 2*consts.NMTIDLen
 
 	p := codec.NewWriter(size, consts.NetworkSizeLimit)
 
@@ -994,6 +1085,11 @@ func (b *StatefulBlock) Marshal() ([]byte, error) {
 
 	p.PackID(b.StateRoot)
 	p.PackUint64(uint64(b.WarpResults))
+
+	p.PackBytes(b.NMTRoot)
+	p.PackBytes(b.NMTMinNS)
+	p.PackBytes(b.NMTMaxNS)
+
 	bytes := p.Bytes()
 	if err := p.Err(); err != nil {
 		return nil, err
@@ -1030,6 +1126,9 @@ func UnmarshalBlock(raw []byte, parser Parser) (*StatefulBlock, error) {
 	p.UnpackID(false, &b.StateRoot)
 	b.WarpResults = set.Bits64(p.UnpackUint64(false))
 
+	p.UnpackBytes(consts.NMTRootLen, false, &b.NMTRoot)
+	p.UnpackBytes(consts.NMTIDLen, false, &b.NMTMinNS)
+	p.UnpackBytes(consts.NMTIDLen, false, &b.NMTMaxNS)
 	// Ensure no leftover bytes
 	if !p.Empty() {
 		return nil, fmt.Errorf("%w: remaining=%d", ErrInvalidObject, len(raw)-p.Offset())
