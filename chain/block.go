@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -57,10 +56,12 @@ type StatefulBlock struct {
 	StateRoot   ids.ID     `json:"stateRoot"`
 	WarpResults set.Bits64 `json:"warpResults"`
 
-	NMTRootString string `json:"nmtRootString"`
-	NMTRoot       []byte `json:"nmtRoot"`
-	NMTMinNS      []byte `json:"nmtMinNS"`
-	NMTMaxNS      []byte `json:"mntMaxNS"`
+	NMTRoot  []byte `json:"nmtRoot"`
+	NMTMinNS []byte `json:"nmtMinNS"`
+	NMTMaxNS []byte `json:"mntMaxNS"`
+
+	NMTNamespaceToTxIndex map[string]int       `json:"namespaceToTxIndex"`
+	NMTProofs             map[string]nmt.Proof `json:"nmtProofs"`
 
 	size int
 
@@ -285,12 +286,17 @@ func (b *StatelessBlock) initializeBuilt(
 	// NMT generation must before block marshal
 	_, nmtSpan := b.vm.Tracer().Start(ctx, "StatelessBlock.NMTGen")
 	txsDataToProve := make([][]byte, 0, len(b.Txs))
+	// store namespaces used in this block
+	nmtNSs := make([][]byte, 0, 10)
+	NMTNamespaceToTxIndex := make(map[string]int)
 	for i := 0; i < len(b.Txs); i++ {
 		tx := b.Txs[i]
 		txResult := results[i]
 		txID := tx.ID()
 
 		nID := tx.Action.NMTNamespace()
+		nmtNSs = append(nmtNSs, nID)
+		NMTNamespaceToTxIndex[string(nID)] = i
 
 		// we only use 1 byte for NID
 		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
@@ -315,14 +321,24 @@ func (b *StatelessBlock) initializeBuilt(
 		return ErrComputingNMTRoot
 	}
 
+	NMTProofs := make(map[string]nmt.Proof)
+	for _, nID := range nmtNSs {
+		proof, err := nmtTree.ProveNamespace(nID)
+		if err != nil {
+			continue
+		}
+
+		NMTProofs[string(nID)] = proof
+	}
+
 	minNS := nmt.MinNamespace(nmtRoot, nmtTree.NamespaceSize())
 	maxNS := nmt.MaxNamespace(nmtRoot, nmtTree.NamespaceSize())
-
-	b.NMTRootString = base64.StdEncoding.EncodeToString(nmtRoot)
 
 	b.NMTMaxNS = maxNS
 	b.NMTMinNS = minNS
 	b.NMTRoot = nmtRoot
+	b.NMTNamespaceToTxIndex = NMTNamespaceToTxIndex
+	b.NMTProofs = NMTProofs
 
 	nmtSpan.End()
 
@@ -642,7 +658,9 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 	b.results = results
 	b.feeManager = feeManager
 
-	// NMT root generation
+	// NMT root verification
+	NMTNamespaceToTxIndex := make(map[string]int)
+	nmtNSs := make([][]byte, 0, 10)
 	txsDataToProve := make([][]byte, 0, len(b.Txs))
 	for i := 0; i < len(b.Txs); i++ {
 		tx := b.Txs[i]
@@ -650,6 +668,8 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 		txID := tx.ID()
 
 		nID := tx.Action.NMTNamespace()
+		nmtNSs = append(nmtNSs, nID)
+		NMTNamespaceToTxIndex[string(nID)] = i
 
 		// we only use 1 byte for NID
 		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
@@ -677,6 +697,20 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 		b.vm.Logger().Warn("nmt root not equal", zap.ByteString("expect", nmtRoot), zap.ByteString("actual", b.NMTRoot))
 		return ErrNMTRootNotEqual
 	}
+
+	NMTProofs := make(map[string]nmt.Proof)
+	for _, nID := range nmtNSs {
+		proof, err := nmtTree.ProveNamespace(nID)
+		if err != nil {
+			continue
+		}
+
+		NMTProofs[string(nID)] = proof
+	}
+
+	// those don't propagate through gossiping, calculated locally, safe since we verify the NMT root
+	b.NMTNamespaceToTxIndex = NMTNamespaceToTxIndex
+	b.NMTProofs = NMTProofs
 
 	// Ensure warp results are correct
 	if invalidWarpResult {
