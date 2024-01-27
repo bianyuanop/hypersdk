@@ -36,4 +36,8 @@ const (
 	NMTRootLen = 48
 	// default
 	NMTIDLen = 8
+	// no more than 20% of [NetworkSizeLimit]
+	MaxNMTProofBytes = 408_944
+	// no more than 10% of the [NetworkSizeLimit]
+	MaxNSTxMappingBytes = 204_472
 )

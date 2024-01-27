@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -56,12 +57,10 @@ type StatefulBlock struct {
 	StateRoot   ids.ID     `json:"stateRoot"`
 	WarpResults set.Bits64 `json:"warpResults"`
 
-	NMTRoot  []byte `json:"nmtRoot"`
-	NMTMinNS []byte `json:"nmtMinNS"`
-	NMTMaxNS []byte `json:"mntMaxNS"`
+	NMTRoot []byte `json:"nmtRoot"`
 
-	NMTNamespaceToTxIndex map[string]int       `json:"namespaceToTxIndex"`
-	NMTProofs             map[string]nmt.Proof `json:"nmtProofs"`
+	NMTNamespaceToTxIndexes map[string][]int     `json:"namespaceToTxIndex"`
+	NMTProofs               map[string]nmt.Proof `json:"nmtProofs"`
 
 	size int
 
@@ -158,6 +157,7 @@ func ParseBlock(
 
 	blk, err := UnmarshalBlock(source, vm)
 	if err != nil {
+		vm.Logger().Warn("unable to marshal block", zap.Error(err))
 		return nil, err
 	}
 	// Not guaranteed that a parsed block is verified
@@ -288,7 +288,7 @@ func (b *StatelessBlock) initializeBuilt(
 	txsDataToProve := make([][]byte, 0, len(b.Txs))
 	// store namespaces used in this block
 	nmtNSs := make([][]byte, 0, 10)
-	NMTNamespaceToTxIndex := make(map[string]int)
+	NMTNamespaceToTxIndexes := make(map[string][]int)
 	for i := 0; i < len(b.Txs); i++ {
 		tx := b.Txs[i]
 		txResult := results[i]
@@ -296,9 +296,14 @@ func (b *StatelessBlock) initializeBuilt(
 
 		nID := tx.Action.NMTNamespace()
 		nmtNSs = append(nmtNSs, nID)
-		NMTNamespaceToTxIndex[string(nID)] = i
 
-		// we only use 1 byte for NID
+		if _, ok := NMTNamespaceToTxIndexes[string(nID)]; !ok {
+			NMTNamespaceToTxIndexes[string(nID)] = make([]int, 0, 1)
+		}
+		a := NMTNamespaceToTxIndexes[string(nID)]
+		a = append(a, i)
+		NMTNamespaceToTxIndexes[string(nID)] = a
+
 		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
 		txData = append(txData, nID...)
 		txData = append(txData, txID[:]...)
@@ -331,13 +336,8 @@ func (b *StatelessBlock) initializeBuilt(
 		NMTProofs[string(nID)] = proof
 	}
 
-	minNS := nmt.MinNamespace(nmtRoot, nmtTree.NamespaceSize())
-	maxNS := nmt.MaxNamespace(nmtRoot, nmtTree.NamespaceSize())
-
-	b.NMTMaxNS = maxNS
-	b.NMTMinNS = minNS
 	b.NMTRoot = nmtRoot
-	b.NMTNamespaceToTxIndex = NMTNamespaceToTxIndex
+	b.NMTNamespaceToTxIndexes = NMTNamespaceToTxIndexes
 	b.NMTProofs = NMTProofs
 
 	nmtSpan.End()
@@ -659,8 +659,6 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 	b.feeManager = feeManager
 
 	// NMT root verification
-	NMTNamespaceToTxIndex := make(map[string]int)
-	nmtNSs := make([][]byte, 0, 10)
 	txsDataToProve := make([][]byte, 0, len(b.Txs))
 	for i := 0; i < len(b.Txs); i++ {
 		tx := b.Txs[i]
@@ -668,15 +666,21 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 		txID := tx.ID()
 
 		nID := tx.Action.NMTNamespace()
-		nmtNSs = append(nmtNSs, nID)
-		NMTNamespaceToTxIndex[string(nID)] = i
 
-		// we only use 1 byte for NID
 		txData := make([]byte, 1+len(txID[:])+len(txResult.Output))
 		txData = append(txData, nID...)
 		txData = append(txData, txID[:]...)
 		txData = append(txData, txResult.Output...)
 		txsDataToProve = append(txsDataToProve, txData)
+	}
+
+	proofJson, err := json.Marshal(b.NMTProofs)
+	if err != nil {
+		b.vm.Logger().Debug("check if proofs are received", zap.String("proof", string(proofJson)))
+	}
+	txMappingJson, err := json.Marshal(b.NMTNamespaceToTxIndexes)
+	if err != nil {
+		b.vm.Logger().Debug("check if transactions mapping received", zap.String("txMapping", string(txMappingJson)))
 	}
 
 	nmtTree := nmt.New(sha256.New())
@@ -697,20 +701,6 @@ func (b *StatelessBlock) innerVerify(ctx context.Context, vctx VerifyContext) er
 		b.vm.Logger().Warn("nmt root not equal", zap.ByteString("expect", nmtRoot), zap.ByteString("actual", b.NMTRoot))
 		return ErrNMTRootNotEqual
 	}
-
-	NMTProofs := make(map[string]nmt.Proof)
-	for _, nID := range nmtNSs {
-		proof, err := nmtTree.ProveNamespace(nID)
-		if err != nil {
-			continue
-		}
-
-		NMTProofs[string(nID)] = proof
-	}
-
-	// those don't propagate through gossiping, calculated locally, safe since we verify the NMT root
-	b.NMTNamespaceToTxIndex = NMTNamespaceToTxIndex
-	b.NMTProofs = NMTProofs
 
 	// Ensure warp results are correct
 	if invalidWarpResult {
@@ -1100,7 +1090,7 @@ func (b *StatefulBlock) Marshal() ([]byte, error) {
 		consts.Uint64Len + window.WindowSliceSize +
 		consts.IntLen + codec.CummSize(b.Txs) +
 		consts.IDLen + consts.Uint64Len + consts.Uint64Len +
-		consts.NMTRootLen + 2*consts.NMTIDLen
+		consts.NMTRootLen
 
 	p := codec.NewWriter(size, consts.NetworkSizeLimit)
 
@@ -1121,8 +1111,17 @@ func (b *StatefulBlock) Marshal() ([]byte, error) {
 	p.PackUint64(uint64(b.WarpResults))
 
 	p.PackBytes(b.NMTRoot)
-	p.PackBytes(b.NMTMinNS)
-	p.PackBytes(b.NMTMaxNS)
+
+	proofsJson, err := json.Marshal(b.NMTProofs)
+	if err != nil {
+		return nil, err
+	}
+	p.PackBytes(proofsJson)
+	nmtNSTxMapping, err := json.Marshal(b.NMTNamespaceToTxIndexes)
+	if err != nil {
+		return nil, err
+	}
+	p.PackBytes(nmtNSTxMapping)
 
 	bytes := p.Bytes()
 	if err := p.Err(); err != nil {
@@ -1161,8 +1160,25 @@ func UnmarshalBlock(raw []byte, parser Parser) (*StatefulBlock, error) {
 	b.WarpResults = set.Bits64(p.UnpackUint64(false))
 
 	p.UnpackBytes(consts.NMTRootLen, false, &b.NMTRoot)
-	p.UnpackBytes(consts.NMTIDLen, false, &b.NMTMinNS)
-	p.UnpackBytes(consts.NMTIDLen, false, &b.NMTMaxNS)
+	proofs := make(map[string]nmt.Proof)
+	// unknown how much to allocate in advance
+	proofsBytes := make([]byte, 0, 1024)
+	p.UnpackBytes(consts.MaxNMTProofBytes, false, &proofsBytes)
+	err := json.Unmarshal(proofsBytes, &proofs)
+	if err != nil {
+		return nil, err
+	}
+	txNSMappingBytes := make([]byte, 0, 256)
+	txNsMapping := make(map[string][]int)
+	p.UnpackBytes(consts.MaxNSTxMappingBytes, false, &txNSMappingBytes)
+	err = json.Unmarshal(txNSMappingBytes, &txNsMapping)
+	if err != nil {
+		return nil, err
+	}
+
+	b.NMTProofs = proofs
+	b.NMTNamespaceToTxIndexes = txNsMapping
+
 	// Ensure no leftover bytes
 	if !p.Empty() {
 		return nil, fmt.Errorf("%w: remaining=%d", ErrInvalidObject, len(raw)-p.Offset())
