@@ -151,4 +151,4 @@ replace github.com/AnomalyFi/hypersdk => /
 
 replace github.com/tetratelabs/wazero => github.com/ava-labs/wazero v0.0.2-hypersdk
 
-replace github.com/ava-labs/avalanchego => ../avalanchego
+replace github.com/ava-labs/avalanchego => github.com/bianyuanop/avalanchego v1.10.10-beta.2
