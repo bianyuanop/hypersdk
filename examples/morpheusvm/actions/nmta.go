@@ -8,7 +8,6 @@ import (
 	"github.com/AnomalyFi/hypersdk/consts"
 	"github.com/AnomalyFi/hypersdk/crypto/ed25519"
 	"github.com/AnomalyFi/hypersdk/examples/morpheusvm/auth"
-	mconsts "github.com/AnomalyFi/hypersdk/examples/morpheusvm/consts"
 	"github.com/AnomalyFi/hypersdk/examples/morpheusvm/storage"
 
 	"github.com/AnomalyFi/hypersdk/state"
@@ -25,7 +24,7 @@ type NMTTestAction struct {
 }
 
 func (*NMTTestAction) GetTypeID() uint8 {
-	return mconsts.NMTTestActionID
+	return NMTTestActionID
 }
 
 func (t *NMTTestAction) StateKeys(rauth chain.Auth, _ ids.ID) []string {
